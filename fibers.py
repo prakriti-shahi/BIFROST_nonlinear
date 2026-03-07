@@ -10,6 +10,7 @@ import numpy as np
 from scipy import optimize as opt
 import numpy.typing as npt
 import typing
+import raman
 
 # Constants
 # -------------------------------------------------------------------------------------------------
@@ -68,6 +69,15 @@ _PhotoelasticConstants = {'SiO2': [0.121, 0.270], 'GeO2': [0.130, 0.288]}
 
 _YoungModulus = {'SiO2': 74e9, 'GeO2': 45.5e9}
 """ Young's modulus for silica and germania (Pa) """
+
+_n2 = {'SiO2': 2.2e-20, 'GeO2': 4.6e-20}
+"""
+Nonlinear (Kerr) refractive index n_2 (m²/W) for pure silica and pure germania.
+
+SiO2 value from Agrawal, *Nonlinear Fiber Optics*, 6th ed. (2019), Table 2.1.
+GeO2 value from Kato et al., *Opt. Lett.* 20, 2279 (1995), scaled to 1550 nm.
+Linear mixing is used for doped compositions (see _calcN2).
+"""
 
 # Validation utility methods
 # -------------------------------------------------------------------------------------------------
@@ -534,6 +544,108 @@ def _getRandom(n0: int | tuple, mean: float, scale: float, dist: str) -> npt.NDA
         return arr
     elif (dist == 'uniform_int'):
         return np.random.randint(int(mean - scale), high=int(mean + scale), size=n0)
+    
+def _calcN2(m: float) -> float:
+    """
+    Nonlinear refractive index n_2 (m²/W) for a Germania-doped silica glass.
+
+    Uses linear mixing of the pure-component values weighted by the molar
+    fraction of germania m.  For fluorine-doped or undoped silica (m ≤ 0)
+    the pure-silica value is returned.
+
+    Parameters
+    ----------
+    m : float
+        Molar fraction of GeO2 in the glass (0 ≤ m ≤ 1).
+        Negative values (fluorine doping) are treated as pure SiO2.
+
+    Returns
+    -------
+    float
+        n_2 in m²/W.
+
+    References
+    ----------
+    Agrawal, *Nonlinear Fiber Optics*, 6th ed., Table 2.1 (2019).
+    Kato et al., *Opt. Lett.* 20, 2279–2281 (1995).
+    """
+    if m <= 0:
+        return _n2['SiO2']
+    return (1 - m) * _n2['SiO2'] + m * _n2['GeO2']
+
+
+def _calcAeff(r0: float, v: float) -> float:
+    """
+    Effective mode area A_eff (m²) using the Marcuse Gaussian approximation
+    for the LP01 mode of a step-index fiber.
+
+    The mode-field radius w (1/e² half-width of the intensity) is given by:
+
+    .. math::
+        \\frac{w}{r_0} = 0.65 + \\frac{1.619}{V^{3/2}} + \\frac{2.879}{V^6}
+
+    and the effective area follows from A_eff = π w².
+
+    The empirical formula is valid for 1.2 < V < 2.4.  A RuntimeWarning is
+    issued outside this range, but the value is still returned.
+
+    Parameters
+    ----------
+    r0 : float
+        Core radius (m).
+    v : float
+        Normalized frequency (V-number), dimensionless.
+
+    Returns
+    -------
+    float
+        A_eff in m².
+
+    References
+    ----------
+    Marcuse, *J. Opt. Soc. Am.* 68, 103–109 (1978), Eq. (15).
+    Agrawal, *Nonlinear Fiber Optics*, 6th ed., Eq. (2.2.43) (2019).
+    """
+    import warnings
+    if not (1.2 <= v <= 2.5):
+        warnings.warn(
+            "V = {:.3f} is outside the range 1.2–2.4 for which the Marcuse "
+            "formula is calibrated; A_eff may be inaccurate.".format(v),
+            RuntimeWarning, stacklevel=2
+        )
+    w_over_r0 = 0.65 + 1.619 / v**1.5 + 2.879 / v**6
+    w = w_over_r0 * r0
+    return pi * w**2
+
+
+def _calcGamma(w0: float, n2: float, Aeff: float) -> float:
+    """
+    Nonlinear coefficient γ (W⁻¹ m⁻¹) of the fiber.
+
+    .. math::
+        \\gamma = \\frac{2\\pi}{\\lambda} \\frac{n_2}{A_{\\text{eff}}}
+                = \\frac{\\omega_0}{c} \\frac{n_2}{A_{\\text{eff}}}
+
+    Parameters
+    ----------
+    w0 : float
+        Wavelength (m).
+    n2 : float
+        Nonlinear refractive index of the core glass (m²/W).
+    Aeff : float
+        Effective mode area (m²).
+
+    Returns
+    -------
+    float
+        γ in W⁻¹ m⁻¹.
+
+    References
+    ----------
+    Agrawal, *Nonlinear Fiber Optics*, 6th ed., Eq. (2.3.29) (2019).
+    """
+    return (2 * pi / w0) * n2 / Aeff
+
 
 # FiberLength class definition
 # -------------------------------------------------------------------------------------------------
@@ -663,6 +775,104 @@ class FiberLength():
         B_BND = _calc_B_BND(self.w0, n0, p11, p12, nu_p, self.r1, self.rc, E, tf=self.tf)
         B_TWS = _calc_B_TWS(n0, p11, p12, self.tr)
         return _calc_J0(beta, B_CNC, B_ATS, B_BND, B_TWS, Lt)
+    
+    @property
+    def Aeff(self) -> float:
+        """
+        Effective mode area A_eff (m²), computed from the Marcuse Gaussian
+        approximation for the LP01 mode.
+
+        See :func:`_calcAeff` for details and validity range.
+        """
+        return _calcAeff(self.r0, self.v)
+
+    @property
+    def gamma(self) -> float:
+        """
+        Nonlinear coefficient γ (W⁻¹ m⁻¹).
+
+        Uses the core molar-fraction of germania (m0) to obtain n_2 via
+        linear mixing, and the Marcuse effective area for the mode.
+        Fluorine-doped or undoped cores (m0 ≤ 0) use the pure-silica n_2.
+
+        See :func:`_calcGamma` and :func:`_calcN2` for details.
+        """
+        n2 = _calcN2(self.m0)
+        return _calcGamma(self.w0, n2, self.Aeff)
+    
+    def calcBeta2(self, dw0: float = 0.1e-9) -> float:
+        """
+        Group-velocity dispersion parameter β₂ = d²β/dω² (s²/m).
+
+        Computed from the chromatic dispersion coefficient D_CD via the exact
+        analytic relation
+
+        .. math::
+            \\beta_2 = -\\frac{\\lambda^2}{2\\pi c} \\, D
+
+        where D is in SI units (s/m²).  This avoids the spurious first-derivative
+        contamination that arises from a symmetric finite difference in wavelength
+        (λ and ω are not linearly related, so a symmetric λ-step is not a symmetric
+        ω-step at second order).
+
+        Sign convention: β₂ < 0 in the anomalous-dispersion regime (λ > λ_ZD).
+        For SMF-28 at 1550 nm the expected value is approximately −16 to −22 ps²/km
+        depending on exact fiber parameters, consistent with D_CD ~ 12–18 ps/(nm·km).
+
+        Parameters
+        ----------
+        dw0 : float, optional
+            Wavelength step passed to :meth:`calcD_CD` (m). Default is 0.1 nm.
+
+        Returns
+        -------
+        float
+            β₂ in s²/m.
+
+        References
+        ----------
+        Agrawal, *Nonlinear Fiber Optics*, 6th ed., Eq. (1.2.11) (2019).
+        """
+        # D_CD is in ps/(nm·km); convert to SI (s/m²)
+        D_SI = self.calcD_CD(dw0) * 1e-12 / (1e-9 * 1e3)   # s/m²
+        return -(self.w0**2 / (2 * pi * C_c)) * D_SI
+    
+    def calcSpRamNoise(self,
+                    lambda_ref: float,
+                    lambda_quantum: float,
+                    delta_lambda: float,
+                    P_ref: float,
+                    pump_depletion = False) -> dict:
+        """
+        Calculate spontaneous Raman noise photon rate at the quantum channel
+        arising from a co-propagating classical reference channel.
+
+        Parameters
+        ----------
+        lambda_ref     : float  Reference (pump) channel wavelength (m).
+        lambda_quantum : float  Quantum channel centre wavelength (m).
+        delta_lambda   : float  Quantum channel bandwidth (m).
+        P_ref          : float  Reference channel power (W).
+
+        Returns
+        -------
+        dict   See raman.spRam_noise_in_channel for keys.
+        """
+        result = raman.check_depletion_validity(
+            g_R_peak = raman.g_R(
+                np.array([raman.RAMAN_OMEGA_R]), self.gamma)[0],
+            P_pump   = P_ref,
+            L        = self.Lt)
+        return raman.spRam_noise_in_channel(
+            lambda_pump=lambda_ref,
+            lambda_channel=lambda_quantum,
+            delta_lambda=delta_lambda,
+            P_pump=P_ref,
+            L=self.Lt,
+            gamma=self.gamma,
+            T=self.T0 + 273.15,
+            pump_depletion=pump_depletion)
+
 
     def __init__(self, w0: float, T0: float, L0: float, r0: float, r1: float, epsilon: float, m0: float,
                  m1: float, Tref: float, rc: float, tf: float, tr: float,
@@ -1393,6 +1603,21 @@ class Fiber():
         if (self._printingBool):
             return fa, hingeInds, L0
         return L0
+    
+    def calcSpRamNoise(self, lambda_ref, lambda_quantum, delta_lambda, P_ref) -> dict:
+        """Cumulative spRam noise over all fiber segments and hinges."""
+        total_stokes = 0.0
+        total_antistokes = 0.0
+        for f in self.fibers:
+            if hasattr(f, 'calcSpRamNoise'):
+                result = f.calcSpRamNoise(lambda_ref, lambda_quantum, delta_lambda, P_ref)
+                total_stokes     += result.get('stokes_photons_per_sec', 0.0)
+                total_antistokes += result.get('antistokes_photons_per_sec', 0.0)
+        return {
+            'stokes_photons_per_sec'    : total_stokes,
+            'antistokes_photons_per_sec': total_antistokes,
+        }
+
 
     # N0: number of long segments
     # hingeType = 0 (fiber paddle sets), 1 (arbitrary rotators)
@@ -1774,3 +1999,178 @@ class Fiber():
         self._printingBool = False
         sep = "\n"
         return sep.join(info_array)
+
+print("Finished run")
+
+if __name__ == '__main__':
+    import sys
+    print("=" * 65)
+    print("Pump-depletion correction — validation demo")
+    print("=" * 65)
+
+    try:
+        import raman
+        import raman_tabulated as rt
+    except ImportError as e:
+        sys.exit(f"Cannot import raman modules: {e}")
+
+    _c    = 299_792_458.0
+    _hbar = 1.054_571_817e-34
+    _kB   = 1.380_649e-23
+    pi    = np.pi
+
+    gamma = 1.3e-3
+    L     = 25e3
+    T     = 300.0
+
+    # g_R peak value (tabulated model)
+    Om_peak   = np.array([13.2e12 * 2*pi])
+    gR_peak   = float(rt.g_R_tabulated(Om_peak, gamma)[0])
+
+    print(f"\ng_R_peak = {gR_peak:.4e} W⁻¹m⁻¹  "
+          f"(tabulated, SMF-28, 1550 nm)")
+    print(f"L = {L/1e3:.0f} km")
+    print()
+
+    # -----------------------------------------------------------------------
+    # Table 1: correction as a function of pump power
+    # -----------------------------------------------------------------------
+    print(f"{'Power':>10}  {'x=g_R·P·L':>12}  {'ratio':>8}  "
+          f"{'correction':>12}  {'valid?':>8}")
+    print("-" * 58)
+    for P_mW in [0.1, 1.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0]:
+        P  = P_mW * 1e-3
+        x  = raman.depletion_gain_param(gR_peak, P, L)
+        r  = float(np.expm1(x) / x) if x > 1e-10 else 1.0
+        ok = (r - 1) < 0.10
+        print(f"  {P_mW:6.1f} mW  {x:12.4f}  {r:8.4f}  "
+              f"{(r-1)*100:10.1f}%  {'✓' if ok else '✗ USE CORRECTION'}")
+
+    # -----------------------------------------------------------------------
+    # Table 2: Stokes noise — undepleted vs corrected at 1310→1550 nm setup
+    # -----------------------------------------------------------------------
+    print()
+    print("Practical WDM geometry: λ_ref=1444 nm (~Raman peak from 1550 nm), λ_Q=1550 nm, L=25 km")
+    print("(1444 nm pump → 13.2 THz Raman shift into 1550 nm quantum channel)")
+    print(f"{'Power':>10}  {'undepleted':>14}  {'corrected':>14}  {'ratio':>8}")
+    print("-" * 55)
+
+    # Use a pump wavelength that gives 13.2 THz Raman shift at 1550 nm
+    # 1/λ_pump - 1/λ_Q = Ω/(2πc)  =>  λ_pump = 1/(1/λ_Q + Ω/(2πc))
+    Om_raman     = 13.2e12 * 2*pi
+    lambda_ch    = 1550e-9
+    lambda_pump  = 1.0 / (1.0/lambda_ch + Om_raman/(2*pi*_c))
+    delta_lam    = 0.5e-9
+    omega_pump_p = 2*pi*_c / lambda_pump
+    omega_ch     = 2*pi*_c / lambda_ch
+    Om_centre    = np.abs(omega_pump_p - omega_ch)
+
+    print(f"  λ_ref = {lambda_pump*1e9:.1f} nm,  Raman shift = {Om_centre/(2*pi*1e12):.2f} THz")
+
+    nth   = 1.0 / (np.expm1(_hbar * Om_centre / (_kB * T)))
+    gR_ch = float(rt.g_R_tabulated(np.array([Om_centre]), gamma)[0])
+    Dnu   = _c / lambda_ch**2 * delta_lam   # Hz
+
+    for P_mW in [1.0, 10.0, 100.0]:
+        P   = P_mW * 1e-3
+        N_u = gR_ch * P * L * (nth + 1) * Dnu / (2*pi)
+        x   = gR_ch * P * L
+        N_c = float(np.expm1(x)) * (nth + 1) * Dnu / (2*pi)
+        ratio_str = f"{N_c/N_u:8.4f}" if N_u > 0 else "     N/A"
+        print(f"  {P_mW:6.1f} mW  {N_u:14.3e}  {N_c:14.3e}  {ratio_str}")
+
+    # -----------------------------------------------------------------------
+    # Curve: noise vs fiber length showing when correction kicks in
+    # -----------------------------------------------------------------------
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
+    P_demo   = 50e-3    # 50 mW — correction clearly visible
+    L_arr    = np.logspace(1, 5.5, 500)   # 10 m to ~300 km
+    x_arr    = gR_peak * P_demo * L_arr
+
+    # Use single Omega for the demo (Raman peak, Stokes)
+    nth_demo = 1.0 / (np.expm1(_hbar * Om_peak[0] / (_kB * T)))
+    factor   = nth_demo + 1.0
+    Dnu_demo = 1e9   # 1 GHz placeholder bandwidth
+
+    N_undep = gR_peak * P_demo * L_arr * factor * Dnu_demo / (2*pi)
+    N_corr  = np.expm1(x_arr)          * factor * Dnu_demo / (2*pi)
+
+    # Threshold line
+    x_10 = 0.1877   # g_R*P*L = 0.19 → 10% correction
+    L_10 = x_10 / (gR_peak * P_demo)
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    fig.suptitle(f'Pump-depletion correction  (P = {P_demo*1e3:.0f} mW, '
+                 f'g_R = g_R_peak, T = {T:.0f} K)',
+                 fontsize=12)
+
+    # Left: absolute noise
+    ax = axes[0]
+    ax.loglog(L_arr/1e3, N_undep, '--', color='#c0392b', lw=2,
+              label='Undepleted (linear in L)')
+    ax.loglog(L_arr/1e3, N_corr,  '-',  color='#1a6faf', lw=2,
+              label='Corrected [exp(g_R P L)−1]')
+    ax.axvline(L_10/1e3, color='gray', lw=0.9, ls=':')
+    ax.text(L_10/1e3*1.08, N_corr[0]*2,
+            f'10% threshold\nL = {L_10/1e3:.1f} km', fontsize=8.5, color='gray')
+    ax.set_xlabel('Fiber length  L  (km)', fontsize=11)
+    ax.set_ylabel('Stokes photon rate  (arb. units)', fontsize=11)
+    ax.set_title('Absolute noise vs L', fontsize=10)
+    ax.legend(fontsize=9)
+    ax.grid(True, which='both', ls='--', lw=0.5, alpha=0.5)
+
+    # Right: correction ratio
+    ax2 = axes[1]
+    ax2.semilogx(L_arr/1e3, N_corr/N_undep, color='#1a6faf', lw=2)
+    ax2.axhline(1.0,  color='gray',    lw=0.8, ls=':')
+    ax2.axhline(1.10, color='#e67e22', lw=0.9, ls='--',
+                label='10% threshold')
+    ax2.axhline(2.0,  color='#c0392b', lw=0.9, ls='--',
+                label='2× threshold (undepleted doubles error)')
+    ax2.axvline(L_10/1e3, color='#e67e22', lw=0.9, ls=':')
+    ax2.set_xlabel('Fiber length  L  (km)', fontsize=11)
+    ax2.set_ylabel('Corrected / Undepleted', fontsize=11)
+    ax2.set_title('Correction ratio  [exp(x)−1] / x  where x = g_R P L',
+                  fontsize=10)
+    ax2.legend(fontsize=9)
+    ax2.grid(True, which='both', ls='--', lw=0.5, alpha=0.5)
+
+    # Also add a second x-axis showing g_R*P*L
+    ax3 = ax2.twiny()
+    ax3.set_xscale('log')
+    ax3.set_xlim(ax2.get_xlim())
+    x_ticks_L = np.array([0.01, 0.1, 1, 10, 100, 300]) * 1e3
+    x_ticks_x = gR_peak * P_demo * x_ticks_L
+    # Only show where in L range
+    mask_ax = (x_ticks_L/1e3 >= ax2.get_xlim()[0]) & \
+              (x_ticks_L/1e3 <= ax2.get_xlim()[1])
+    ax3.set_xticks((x_ticks_L/1e3)[mask_ax])
+    ax3.set_xticklabels([f'{v:.2g}' for v in x_ticks_x[mask_ax]], fontsize=8)
+    ax3.set_xlabel('g_R · P · L  (gain parameter x)', fontsize=9)
+
+    plt.tight_layout()
+    for fmt in ('pdf', 'png'):
+        plt.savefig(f'depletion_correction.{fmt}', dpi=160,
+                    bbox_inches='tight')
+        print(f"\nSaved: depletion_correction.{fmt}")
+    plt.close()
+
+    print()
+    print("=" * 65)
+    print("Summary of changes needed in raman.py:")
+    print("  1. Add depletion_gain_param() function")
+    print("  2. Add check_depletion_validity() function")
+    print("  3. Add _spRam_rate_density_core() helper")
+    print("  4. Add pump_depletion=False to spRam_photon_rate_density signature")
+    print("  5. Replace last two lines of spRam_photon_rate_density body")
+    print("  6. Add pump_depletion=False to spRam_noise_in_channel signature")
+    print("  7. Pass pump_depletion to both spRam_photon_rate_density calls")
+    print()
+    print("Changes needed in fibers.py:")
+    print("  1. Add pump_depletion=False to calcSpRamNoise signature")
+    print("  2. Add check_depletion_validity call inside calcSpRamNoise")
+    print("  3. Pass pump_depletion to raman.spRam_noise_in_channel call")
+    print("=" * 65)
