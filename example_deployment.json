@@ -1,0 +1,90 @@
+{
+  "wavelength_nm": 1550,
+
+  "fiber": {
+    "core_radius_um": 4.1,
+    "cladding_radius_um": 62.5,
+    "core_GeO2_mol_fraction": 0.036,
+    "cladding_GeO2_mol_fraction": 0.0,
+    "noncircularity_epsilon": 1.002,
+    "reference_temperature_C": 20,
+
+    "spinning": {
+      "enabled": true,
+      "spin_type": "sinusoidal",
+      "spin_rate_rad_per_m": 50,
+      "spin_modulation_omega_rad_per_m": 10,
+      "_comment": "These apply to all 'straight' and 'spun' segments by default. Spin period ~0.63 m, modulation index m=10. Pole wraps and paddle controllers are NOT spun because bending dominates or they are separate devices."
+    }
+  },
+
+  "sections": [
+    {
+      "name": "Underground duct — campus to building A",
+      "environment": "underground",
+      "segments": [
+        {"type": "straight", "length_m": 200, "temperature_C": 15},
+        {"type": "splice", "loss_dB": 0.05},
+        {"type": "straight", "length_m": 300, "temperature_C": 15}
+      ],
+      "_comment": "Buried fiber at stable temperature. Two segments joined by a fusion splice. Each straight segment uses the fiber-level spin parameters. The splice acts as a natural hinge (birefringence axis scrambling at the fusion point)."
+    },
+    {
+      "name": "Aerial span — building A to building B",
+      "environment": "aerial",
+      "segments": [
+        {"type": "straight", "length_m": 80, "temperature_C": 35},
+        {
+          "type": "pole_wrap",
+          "bend_radius_m": 0.15,
+          "n_turns": 3,
+          "tension_N": 0.5,
+          "temperature_C": 35,
+          "_comment": "Fiber wrapped around a utility pole. Short (~2.8 m), tightly bent. NOT spun — bending birefringence dominates. Acts as a natural hinge."
+        },
+        {"type": "straight", "length_m": 120, "temperature_C": 35},
+        {
+          "type": "pole_wrap",
+          "bend_radius_m": 0.15,
+          "n_turns": 2,
+          "tension_N": 0.3,
+          "temperature_C": 35
+        },
+        {"type": "straight", "length_m": 60, "temperature_C": 35}
+      ],
+      "_comment": "Aerial fiber between poles. Straight runs are spun (same spool of fiber). Pole wraps introduce bending birefringence and act as natural hinges. Temperature is higher and more variable than underground."
+    },
+    {
+      "name": "Indoor — building B patch panel",
+      "environment": "indoor",
+      "segments": [
+        {"type": "straight", "length_m": 30, "temperature_C": 22},
+        {
+          "type": "paddle_controller",
+          "n_paddles": 3,
+          "paddle_radii_m": [0.028, 0.028, 0.028],
+          "paddle_angles_deg": [45, 0, -30],
+          "n_turns": [2, 2, 2],
+          "gap_lengths_m": [0.02, 0.02, 0.02],
+          "temperature_C": 22,
+          "_comment": "ThorLabs-style fiber paddle set for manual polarization compensation. NOT spun — it is a separate device that IS the hinge/compensator."
+        },
+        {"type": "straight", "length_m": 5, "temperature_C": 22}
+      ]
+    }
+  ],
+
+  "hinge_model": {
+    "type": "rotator",
+    "at_section_boundaries": true,
+    "at_splices": true,
+    "_comment": "Random rotators are inserted at section boundaries (underground-aerial, aerial-indoor) and at splice points. Pole wraps are NOT given additional hinges because the bending itself scrambles the axes deterministically."
+  },
+
+  "analysis": {
+    "pump_wavelength_nm": 1550,
+    "pump_power_mW": 1.0,
+    "quantum_channel_wavelength_nm": 1310,
+    "quantum_channel_bandwidth_nm": 1.0
+  }
+}
